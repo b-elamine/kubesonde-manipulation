@@ -221,23 +221,52 @@ This file defines the **output** structures — what the REST API returns as JSO
 type ProbeOutput struct {
     Items                      []ProbeOutputItem   // each individual probe result
     Errors                     []ProbeOutputError  // probes that failed to execute
-    PodNetworkingV2            PodNetworkingInfoV2 // actual listening ports per pod
+    PodNetworking              []PodNetworkingInfo // DEPRECATED — use PodNetworkingV2
+    PodNetworkingV2            PodNetworkingInfoV2 // actual listening ports per pod (from netstat)
     PodConfigurationNetworking PodNetworkingInfoV2 // ports declared in pod spec
+    Start                      string              // scan start time (currently unused)
+    End                        string              // scan end time (currently unused)
 }
 
 type ProbeOutputItem struct {
-    Type            ProbeOutputItemType  // "Probe" or "Information"
-    ExpectedAction  ActionType           // what we expected ("Allow" or "Deny")
-    ResultingAction ActionType           // what actually happened
-    Source          ProbeEndpointInfo    // source pod/service
-    Destination     ProbeEndpointInfo    // destination pod/service/internet
-    Protocol        string               // "TCP", "UDP", "SCTP"
-    Port            string
-    Timestamp       int64
+    Type                ProbeOutputItemType  // "Probe" or "Information"
+    ExpectedAction      ActionType           // what we expected ("Allow" or "Deny")
+    ResultingAction     ActionType           // what actually happened
+    Source              ProbeEndpointInfo    // source pod/service
+    Destination         ProbeEndpointInfo    // destination pod/service/internet
+    DestinationHostnames []string            // reverse-DNS hostnames of destination IP
+    Protocol            string               // "TCP", "UDP", "SCTP"
+    Port                string
+    ForwardedPort       string               // port after NAT (if applicable)
+    Timestamp           int64
+    DebugOutput         string               // raw nmap/curl output for debugging
+}
+
+// PodNetworkingInfoV2 is a map from pod name to its list of listening ports
+type PodNetworkingInfoV2 map[string][]PodNetworkingItem
+
+type PodNetworkingItem struct {
+    Port     string // listening port number
+    IP       string // listening IP address
+    Protocol string // "TCP" or "UDP"
 }
 ```
 
 `ProbeEndpointType` classifies each endpoint as `"Pod"`, `"Service"`, or `"Internet"`.
+
+`ProbeEndpointInfo` carries full metadata about an endpoint:
+
+```go
+type ProbeEndpointInfo struct {
+    Type           ProbeEndpointType // "Pod", "Service", or "Internet"
+    IPAddress      string
+    Name           string            // pod or service name
+    Namespace      string
+    DeploymentName string            // owning deployment (if any)
+    ReplicaSetName string            // owning replicaset (if any)
+    Labels         string            // pod labels as a string
+}
+```
 
 ---
 
@@ -327,6 +356,8 @@ This is where the actual shell commands are constructed. Kubesonde uses `nmap` (
 
 **Command templates:**
 ```go
+const curlCommand     = "curl -s -o /dev/null -I -X GET -w %%{http_code} %s"
+const nmapCommand     = "nmap --open --version-intensity=0 --max-retries=3 -T5 -n -sSU -p %d %s" // TCP+UDP combined
 const nmapTCPCommand  = "nmap --open --version-intensity=0 --max-retries=3 -T5 -n -sT -Pn -p %d %s"
 const nmapUDPCommand  = "nmap --open --version-intensity=0 --max-retries=3 -T5 -n -sU -p %d %s"
 const nmapSCTPCommand = "nmap --open -sY -p %d %s"
@@ -344,10 +375,10 @@ For **pod-to-pod** probing, `buildCommand()` iterates all source/destination pod
 **Probe checker functions:**
 ```go
 func NmapSucceded(output string) bool {
-    // Returns true if nmap reports "1 host up" AND port is "open"
+    // Returns true if nmap reports "1 IP address (1 host up)" AND "open" in output
 }
 func CurlSucceded(output string) bool {
-    // Returns true if HTTP status code < 500
+    // Returns true if HTTP status code > 0 AND < 500
 }
 func NslookupSucceded(output string) bool {
     // Returns true if output contains "Server:"
@@ -470,15 +501,15 @@ This means Kubesonde continuously re-validates your network state. If a NetworkP
 
 ### 4.12 REST API Server
 
-**Files:** `crd/rest_apis/apis.go`, `crd/rest_apis/handler.go`
+**Files:** `crd/rest_apis/apis.go`, `crd/rest_apis/get_probes.go`
 
 A minimal Go HTTP server listening on port `2709`. There is a single endpoint:
 
 ```
-GET /probes  →  returns ProbeOutput as JSON
+GET /probes  →  returns ProbeOutput as JSON (pretty-printed with 2-space indent)
 ```
 
-The handler calls `state.GetResults()` and serializes the result. CORS headers are set to allow the Netlify frontend to fetch directly.
+The handler calls `sm.GetProbeState()` on the singleton `StateManager` and serializes the result with `json.MarshalIndent`. Sets `Content-Type: application/json`. Non-GET requests return `405 Method Not Allowed`.
 
 ---
 
@@ -486,11 +517,29 @@ The handler calls `state.GetResults()` and serializes the result. CORS headers a
 
 **File:** `crd/controllers/state/probe_state_controller.go`
 
-Holds the **final results** (as opposed to event-storage which holds probe definitions). Key stores:
+Holds the **final results** (as opposed to event-storage which holds probe definitions). Implemented as a thread-safe `StateManager` singleton using `sync.RWMutex` — all reads acquire a read lock, all writes acquire a write lock.
 
-- Results list (`[]ProbeOutputItem`) — every executed probe outcome
-- Netstat results (`PodNetworkingInfoV2`) — runtime port maps per pod
-- Pod-has-netstat tracking (`[]string`) — which pods have already been monitored
+```go
+type StateManager struct {
+    mu                  sync.RWMutex
+    probeOutput         v1.ProbeOutput  // the full result set
+    podsWithNetstat     []string        // which pods have been monitored
+    podsWithNetstatLock sync.RWMutex
+}
+```
+
+Key methods:
+
+| Method | Purpose |
+|--------|---------|
+| `AppendProbes(items)` | Appends probe results; deduplicates by `ComparableProbeOutputItem` |
+| `AppendErrors(items)` | Appends error entries; deduplicates |
+| `AppendNetInfoV2(key, items)` | Unions runtime netstat ports for a pod |
+| `SetConfig(podName, items)` | Stores declared (spec) ports for a pod |
+| `GetProbeState()` | Returns a deep copy of the full state |
+| `SetNestatPod(pod)` / `DeleteNetstatPod(pod)` | Tracks which pods have been netstat'd |
+
+Package-level wrappers (`AppendProbes`, `GetProbeState`, etc.) delegate to the singleton for backward-compatible usage across the codebase.
 
 ---
 
@@ -509,10 +558,14 @@ Here is the exact sequence from cluster creation to frontend visualization:
 3. EventListener starts K8s informers
    → For each running pod in the target namespace:
        a. AddPodEvent() is called
-       b. An ephemeral "debugger" container is injected into the pod
-       c. BuildTargetedCommands() generates nmap commands for that pod
-       d. Commands are stored in event-storage and added to state
-       e. Commands are queued in the Dispatcher at HIGH priority
+       b. If pod is not a system pod (kube-apiserver, etcd, etc.), an ephemeral
+          "debugger" container is injected via InstallEphameralContainers()
+       c. BuildTargetedCommands() + BuildCommandsFromPodSelectors() generate
+          nmap commands for that pod
+       d. Commands are stored in event-storage (deduplication happens here)
+       e. New targeted probes are queued in the Dispatcher at HIGH priority
+       f. Services probes and outside-world probes are added to storage only
+          (picked up later by RecursiveProbing)
 
 4. Dispatcher.Run() loops forever
    → Pops a KubesondeCommand from the priority queue
@@ -560,6 +613,8 @@ The JSON returned by `GET /probes` has this shape:
         "name": "wordpress-abc123",
         "namespace": "default",
         "IPAddress": "10.244.1.5",
+        "deploymentName": "wordpress",
+        "replicaSetName": "wordpress-6d4cf56db6",
         "labels": "app=wordpress"
       },
       "destination": {
@@ -567,12 +622,25 @@ The JSON returned by `GET /probes` has this shape:
         "name": "Google",
         "IPAddress": "google.com"
       },
+      "destinationHostnames": [],
       "protocol": "TCP",
       "port": "443",
-      "timestamp": 1704067200
+      "forwardedPort": "",
+      "timestamp": 1704067200,
+      "debugOutput": ""
     }
   ],
-  "errors": [],
+  "errors": [
+    {
+      "value": {
+        "type": "",
+        "source": {"name": "deleted-pod", "namespace": "default", "IPAddress": "10.244.1.9"},
+        "timestamp": 1704067300
+      },
+      "reason": "PodDeleted"
+    }
+  ],
+  "podNetworking": [],
   "podNetworkingv2": {
     "wordpress-abc123": [
       {"port": "8080", "ip": "0.0.0.0", "protocol": "TCP"}
@@ -582,14 +650,19 @@ The JSON returned by `GET /probes` has this shape:
     "wordpress-abc123": [
       {"port": "8080", "ip": "0.0.0.0", "protocol": "TCP"}
     ]
-  }
+  },
+  "start": "",
+  "end": ""
 }
 ```
 
 **Key fields:**
 - `expectedAction` vs `resultingAction`: when these differ, it's a policy violation.
-- `podNetworkingv2`: ports discovered at runtime via netstat (the ground truth).
-- `podConfigurationNetworking`: ports declared in the pod spec (may differ from runtime).
+- `podNetworkingv2`: ports discovered at **runtime** via netstat (ground truth).
+- `podConfigurationNetworking`: ports **declared** in the pod spec (may differ from runtime — hidden ports not declared here are the interesting ones).
+- `podNetworking`: deprecated v1 field — always an empty array, will be removed.
+- `errors`: populated when a pod is deleted mid-scan; `reason: "PodDeleted"`.
+- `start` / `end`: reserved timestamp fields, currently always empty strings.
 
 ---
 
@@ -713,7 +786,7 @@ kubectl delete -f kubesonde.yaml   # remove everything else
 
 ### 10.1 Backend
 
-**Requirements:** Go 1.21+, `kubectl`, a running cluster (or `envtest` for unit tests)
+**Requirements:** Go 1.25+, `kubectl`, a running cluster (or `envtest` for unit tests)
 
 ```bash
 cd crd

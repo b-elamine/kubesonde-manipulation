@@ -111,19 +111,24 @@ func GetDeployment(replica v1.ReplicaSet) (string, error) {
 }
 
 func GetReplicaAndDeployment(client kubernetes.Interface, pod k8sAPI.Pod) (string, string) {
-	if replicaSetName, err := GetReplicaSet(pod); err != nil {
-		return "", ""
-	} else {
-		replicaSet, err := client.AppsV1().ReplicaSets(pod.Namespace).Get(context.TODO(), replicaSetName, metav1.GetOptions{})
-		if err != nil {
-			return replicaSetName, ""
-		}
-		if deployment, err2 := GetDeployment(*replicaSet); err2 != nil {
-			return replicaSetName, ""
-		} else {
-			return replicaSetName, deployment
-		}
-	}
+    if replicaSetName, err := GetReplicaSet(pod); err == nil {
+        replicaSet, err := client.AppsV1().ReplicaSets(pod.Namespace).Get(
+            context.TODO(), replicaSetName, metav1.GetOptions{},
+        )
+        if err != nil {
+            return replicaSetName, ""
+        }
+        if deployment, err2 := GetDeployment(*replicaSet); err2 == nil {
+            return replicaSetName, deployment
+        }
+        return replicaSetName, ""
+    }
+
+    if statefulSetName, err := GetStatefulSet(pod); err == nil {
+        return statefulSetName, statefulSetName
+    }
+
+    return "", pod.Name
 }
 func GetReplicaSet(pod k8sAPI.Pod) (string, error) {
 
@@ -138,6 +143,20 @@ func GetReplicaSet(pod k8sAPI.Pod) (string, error) {
 		return depName[0], nil
 	}
 	return "", errors.New("no replicas")
+}
+
+func GetStatefulSet(pod k8sAPI.Pod) (string, error) {
+    refs := pod.OwnerReferences
+    ssRefs := lo.Filter(refs, func(ref metav1.OwnerReference, idx int) bool {
+        return ref.Kind == "StatefulSet"
+    })
+    names := lo.Map(ssRefs, func(ref metav1.OwnerReference, idx int) string {
+        return ref.Name
+    })
+    if len(names) == 1 {
+        return names[0], nil
+    }
+    return "", errors.New("no statefulset")
 }
 
 func GetDeploymentNamesInNamespace(client kubernetes.Interface, namespace string) []string {

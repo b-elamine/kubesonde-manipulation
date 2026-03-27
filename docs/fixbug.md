@@ -90,27 +90,55 @@ func GetReplicaAndDeployment(client kubernetes.Interface, pod k8sAPI.Pod) (strin
 ## Rebuild and redeploy
 
 The running image is `ghcr.io/kubesonde/controller:latest` pulled from the internet.
-After fixing the code you need to build your own image and load it directly into minikube.
+After fixing the code you need to build your own image and push it to minikube's
+internal registry.
+
+> Note: `minikube docker-env` does not work with multi-node clusters so we use the
+> registry addon instead.
 
 ```bash
+# enable the registry addon (only needed once)
+minikube addons enable registry
+
+# forward the registry to your machine
+kubectl port-forward -n kube-system service/registry 5000:80 &
+
+# go to the crd folder
 cd crd/
 
-# build a local image with your fix
-make docker-build IMG=localhost/kubesonde-controller:fix
+# build and push to the local registry (sudo needed if docker requires it)
+sudo docker build --no-cache -t localhost:5000/kubesonde-controller:fix .
+sudo docker push localhost:5000/kubesonde-controller:fix
 
-# inject it into minikube without needing a registry
-minikube image load localhost/kubesonde-controller:fix
-
-# stop minikube from pulling the upstream image from internet
-kubectl patch deployment kubesonde-controller-manager -n kubesonde-system \
-  --type=json \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
-
-# switch to your fixed image
+# switch the deployment to your fixed image
 kubectl set image deployment/kubesonde-controller-manager \
-  manager=localhost/kubesonde-controller:fix \
+  manager=localhost:5000/kubesonde-controller:fix \
   -n kubesonde-system
+
+# verify
+kubectl rollout status deployment/kubesonde-controller-manager -n kubesonde-system
 ```
 
-Then re-trigger the scans
+---
+
+## Re-trigger scans and get results
+
+```bash
+# go back to the project
+cd /path/to/projects
+
+# delete old scans
+kubectl delete kubesonde --all -n kubesonde-system
+
+# reapply
+kubectl apply -f path-to.../kubesonde-cr-app.yaml
+kubectl apply -f path-to../kubesonde-cr-db.yaml
+
+# wait ~30 seconds then forward the probes API port (runs on 2709)
+kubectl port-forward -n kubesonde-system deployment/kubesonde-controller-manager 9001:2709 &
+
+# save results
+curl -s http://localhost:9001/probes > /tmp/results-fixed.json
 ```
+
+Upload `/tmp/results-fixed.json` to the kubesonde UI to see the graph.
